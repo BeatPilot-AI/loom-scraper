@@ -19,6 +19,24 @@ function parseVTT(vttContent) {
   return transcript.trim();
 }
 
+// Convert relative date strings to days ago
+function parseDaysAgo(dateString) {
+  if (!dateString) return 999; // Unknown dates treated as old
+  
+  const match = dateString.match(/(\d+)\s*(day|week|month|year)/i);
+  if (!match) return 999;
+  
+  const value = parseInt(match[1]);
+  const unit = match[2].toLowerCase();
+  
+  if (unit.includes('day')) return value;
+  if (unit.includes('week')) return value * 7;
+  if (unit.includes('month')) return value * 30;
+  if (unit.includes('year')) return value * 365;
+  
+  return 999;
+}
+
 async function scrapeTranscripts() {
   const browser = await puppeteer.launch({
     headless: true,
@@ -42,36 +60,33 @@ async function scrapeTranscripts() {
   await page.goto('https://www.loom.com/my-videos');
   await page.waitForTimeout(5000);
 
-  // Get videos with their creation dates
+  // Extract videos with their relative dates
   const videos = await page.evaluate(() => {
-    const links = Array.from(document.querySelectorAll('a[href*="/share/"]'));
-    return links.map(link => {
-      const url = link.href;
-      // Try to find date nearby the link
-      const container = link.closest('[data-video-id]') || link.closest('div');
-      const dateElement = container?.querySelector('time');
-      const dateString = dateElement?.getAttribute('datetime') || dateElement?.textContent;
+    const videoCards = Array.from(document.querySelectorAll('a[href*="/share/"]'));
+    
+    return videoCards.map(card => {
+      const url = card.href;
+      // Look for the date text (e.g., "6 days", "1 month")
+      const textContent = card.textContent || '';
+      const dateMatch = textContent.match(/(\d+\s+(day|week|month|year)s?)/i);
       
       return {
         url: url,
-        date: dateString
+        relativeDate: dateMatch ? dateMatch[0] : null
       };
     }).filter((item, index, self) => 
       self.findIndex(v => v.url === item.url) === index
     );
   });
 
-  // Filter to last 2 weeks
-  const twoWeeksAgo = new Date();
-  twoWeeksAgo.setDate(twoWeeksAgo.getDate() - 14);
-  
+  // Filter to videos from last 14 days
   const recentVideos = videos.filter(v => {
-    if (!v.date) return true; // Include if we can't determine date
-    const videoDate = new Date(v.date);
-    return videoDate >= twoWeeksAgo;
+    const daysAgo = parseDaysAgo(v.relativeDate);
+    return daysAgo <= 14;
   });
 
-  console.log(`Found ${videos.length} total videos, ${recentVideos.length} from last 2 weeks`);
+  console.log(`Found ${videos.length} total videos`);
+  console.log(`${recentVideos.length} videos from last 14 days`);
   
   let processedCount = 0;
 
@@ -97,7 +112,7 @@ async function scrapeTranscripts() {
         return 'Untitled';
       });
 
-      console.log(`Processing: ${title}`);
+      console.log(`Processing: ${title} (${video.relativeDate})`);
 
       const vttUrl = await page.evaluate(() => {
         const track = document.querySelector('track[kind="captions"]');
