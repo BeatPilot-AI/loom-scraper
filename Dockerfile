@@ -3,7 +3,7 @@ FROM ghcr.io/puppeteer/puppeteer:21.6.1
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm ci --only=production
+RUN npm install --production
 
 COPY . .
 
