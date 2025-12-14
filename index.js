@@ -1,9 +1,15 @@
 const puppeteer = require('puppeteer');
 const express = require('express');
+const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+);
 
 function parseVTT(vttContent) {
   const lines = vttContent.split('\n');
@@ -17,24 +23,6 @@ function parseVTT(vttContent) {
   }
   
   return transcript.trim();
-}
-
-// Convert relative date strings to days ago
-function parseDaysAgo(dateString) {
-  if (!dateString) return 999; // Unknown dates treated as old
-  
-  const match = dateString.match(/(\d+)\s*(day|week|month|year)/i);
-  if (!match) return 999;
-  
-  const value = parseInt(match[1]);
-  const unit = match[2].toLowerCase();
-  
-  if (unit.includes('day')) return value;
-  if (unit.includes('week')) return value * 7;
-  if (unit.includes('month')) return value * 30;
-  if (unit.includes('year')) return value * 365;
-  
-  return 999;
 }
 
 async function scrapeTranscripts() {
@@ -60,39 +48,34 @@ async function scrapeTranscripts() {
   await page.goto('https://www.loom.com/my-videos');
   await page.waitForTimeout(5000);
 
-  // Extract videos with their relative dates
-  const videos = await page.evaluate(() => {
-    const videoCards = Array.from(document.querySelectorAll('a[href*="/share/"]'));
-    
-    return videoCards.map(card => {
-      const url = card.href;
-      // Look for the date text (e.g., "6 days", "1 month")
-      const textContent = card.textContent || '';
-      const dateMatch = textContent.match(/(\d+\s+(day|week|month|year)s?)/i);
-      
-      return {
-        url: url,
-        relativeDate: dateMatch ? dateMatch[0] : null
-      };
-    }).filter((item, index, self) => 
-      self.findIndex(v => v.url === item.url) === index
-    );
+  const videoLinks = await page.evaluate(() => {
+    const links = Array.from(document.querySelectorAll('a[href*="/share/"]'));
+    return links.map(link => link.href).filter((url, index, self) => self.indexOf(url) === index);
   });
 
-  // Filter to videos from last 14 days
-  const recentVideos = videos.filter(v => {
-    const daysAgo = parseDaysAgo(v.relativeDate);
-    return daysAgo <= 14;
-  });
-
-  console.log(`Found ${videos.length} total videos`);
-  console.log(`${recentVideos.length} videos from last 14 days`);
+  console.log(`Found ${videoLinks.length} videos`);
   
   let processedCount = 0;
+  let skippedCount = 0;
 
-  for (const video of recentVideos) {
+  for (const videoUrl of videoLinks) {
     try {
-      await page.goto(video.url);
+      const videoId = videoUrl.split('/').pop();
+      
+      // Check if already processed in Supabase
+      const { data: existing } = await supabase
+        .from('processed_loom_videos')
+        .select('video_id')
+        .eq('video_id', videoId)
+        .single();
+      
+      if (existing) {
+        console.log(`⏭️  Skipping already processed: ${videoId}`);
+        skippedCount++;
+        continue;
+      }
+
+      await page.goto(videoUrl);
       await page.waitForTimeout(3000);
 
       const title = await page.evaluate(() => {
@@ -112,7 +95,7 @@ async function scrapeTranscripts() {
         return 'Untitled';
       });
 
-      console.log(`Processing: ${title} (${video.relativeDate})`);
+      console.log(`Processing: ${title}`);
 
       const vttUrl = await page.evaluate(() => {
         const track = document.querySelector('track[kind="captions"]');
@@ -134,10 +117,10 @@ async function scrapeTranscripts() {
 
       if (transcript && transcript.length > 50) {
         const payload = {
-          video_id: video.url.split('/').pop(),
+          video_id: videoId,
           title: title,
           transcript: transcript,
-          video_url: video.url,
+          video_url: videoUrl,
           created_at: new Date().toISOString()
         };
 
@@ -150,6 +133,11 @@ async function scrapeTranscripts() {
         });
 
         if (response.ok) {
+          // Mark as processed in Supabase
+          await supabase
+            .from('processed_loom_videos')
+            .insert({ video_id: videoId });
+          
           console.log(`✓ Sent to n8n: ${title}`);
           processedCount++;
         } else {
@@ -159,13 +147,14 @@ async function scrapeTranscripts() {
         console.log('❌ Transcript too short or empty');
       }
     } catch (err) {
-      console.error(`Error processing ${video.url}:`, err.message);
+      console.error(`Error processing ${videoUrl}:`, err.message);
     }
   }
 
   await browser.close();
   console.log(`\n=== Scraping Complete ===`);
-  console.log(`Videos processed: ${processedCount}`);
+  console.log(`New videos processed: ${processedCount}`);
+  console.log(`Already processed (skipped): ${skippedCount}`);
 }
 
 app.get('/scrape', async (req, res) => {
