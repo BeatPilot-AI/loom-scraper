@@ -5,6 +5,20 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+function parseVTT(vttContent) {
+  const lines = vttContent.split('\n');
+  let transcript = '';
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line && !line.startsWith('WEBVTT') && !line.includes('-->') && !line.match(/^\d+$/)) {
+      transcript += line + ' ';
+    }
+  }
+  
+  return transcript.trim();
+}
+
 async function scrapeTranscripts() {
   const browser = await puppeteer.launch({
     headless: true,
@@ -26,83 +40,70 @@ async function scrapeTranscripts() {
 
   console.log('Navigating to videos...');
   await page.goto('https://www.loom.com/my-videos');
-  await page.waitForTimeout(5000); // Give it more time to load
+  await page.waitForTimeout(5000);
 
   const videoLinks = await page.evaluate(() => {
     const links = Array.from(document.querySelectorAll('a[href*="/share/"]'));
-    return links.map(link => ({
-      url: link.href,
-      title: link.getAttribute('title') || link.textContent.trim() || 'Untitled'
-    }));
+    return links.map(link => link.href).filter((url, index, self) => self.indexOf(url) === index);
   });
 
   console.log(`Found ${videoLinks.length} videos`);
 
-  for (const video of videoLinks) {
+  for (const videoUrl of videoLinks) {
     try {
-      console.log(`Processing: ${video.title}`);
-      await page.goto(video.url);
+      await page.goto(videoUrl);
       await page.waitForTimeout(3000);
 
-      // Take screenshot for debugging
-      console.log('Looking for transcript button...');
-      
-      // Try to click transcript button with multiple strategies
-      const transcriptFound = await page.evaluate(() => {
-        // Try multiple ways to find and click transcript
-        const buttons = Array.from(document.querySelectorAll('button'));
-        const transcriptBtn = buttons.find(btn => 
-          btn.textContent.toLowerCase().includes('transcript') ||
-          btn.getAttribute('aria-label')?.toLowerCase().includes('transcript')
-        );
+      // Extract title from the video page
+      const title = await page.evaluate(() => {
+        // Try multiple selectors
+        const h1 = document.querySelector('h1');
+        const pageTitle = document.title;
+        const metaTitle = document.querySelector('meta[property="og:title"]');
         
-        if (transcriptBtn) {
-          transcriptBtn.click();
-          return true;
+        if (h1 && h1.textContent.trim()) {
+          return h1.textContent.trim();
         }
-        return false;
+        if (metaTitle && metaTitle.getAttribute('content')) {
+          return metaTitle.getAttribute('content').replace(' | Loom', '').trim();
+        }
+        if (pageTitle && pageTitle !== 'Loom') {
+          return pageTitle.replace(' | Loom', '').trim();
+        }
+        return 'Untitled';
       });
 
-      if (!transcriptFound) {
-        console.log('❌ No transcript button found, skipping...');
+      console.log(`Processing: ${title}`);
+
+      // Extract VTT caption URL
+      const vttUrl = await page.evaluate(() => {
+        const track = document.querySelector('track[kind="captions"]');
+        return track ? track.getAttribute('src') : null;
+      });
+
+      if (!vttUrl) {
+        console.log('❌ No captions/transcript available');
         continue;
       }
 
-      console.log('✓ Clicked transcript button, waiting for content...');
-      await page.waitForTimeout(3000);
-
-      const transcript = await page.evaluate(() => {
-        // Try multiple selectors
-        const selectors = [
-          '[data-testid="transcript-content"]',
-          '[class*="transcript"]',
-          '[class*="Transcript"]',
-          'div[role="log"]',
-          '.transcript-text'
-        ];
-        
-        for (const selector of selectors) {
-          const el = document.querySelector(selector);
-          if (el && el.innerText && el.innerText.length > 50) {
-            return el.innerText;
-          }
-        }
-        
-        return '';
-      });
+      console.log('✓ Found VTT URL, fetching transcript...');
+      
+      const vttResponse = await page.goto(vttUrl);
+      const vttContent = await vttResponse.text();
+      const transcript = parseVTT(vttContent);
 
       console.log(`Transcript length: ${transcript.length} characters`);
 
       if (transcript && transcript.length > 50) {
         const payload = {
-          video_id: video.url.split('/').pop(),
-          title: video.title,
+          video_id: videoUrl.split('/').pop(),
+          title: title,
           transcript: transcript,
-          video_url: video.url,
+          video_url: videoUrl,
           created_at: new Date().toISOString()
         };
 
-        console.log(`Sending to n8n: ${process.env.N8N_WEBHOOK_URL}`);
+        console.log(`Sending to n8n...`);
         
         const response = await fetch(process.env.N8N_WEBHOOK_URL, {
           method: 'POST',
@@ -111,15 +112,15 @@ async function scrapeTranscripts() {
         });
 
         if (response.ok) {
-          console.log(`✓ Sent to n8n: ${video.title}`);
+          console.log(`✓ Sent to n8n: ${title}`);
         } else {
           console.log(`❌ n8n error: ${response.status} ${response.statusText}`);
         }
       } else {
-        console.log('❌ No transcript content found');
+        console.log('❌ Transcript too short or empty');
       }
     } catch (err) {
-      console.error(`Error processing ${video.url}:`, err.message);
+      console.error(`Error processing ${videoUrl}:`, err.message);
     }
   }
 
@@ -127,17 +128,14 @@ async function scrapeTranscripts() {
   console.log('Scraping complete!');
 }
 
-// HTTP endpoint to trigger scraping
 app.get('/scrape', async (req, res) => {
   res.json({ status: 'started', message: 'Scraping Loom transcripts...' });
   
-  // Run scraping in background
   scrapeTranscripts().catch(err => {
     console.error('Scraping error:', err);
   });
 });
 
-// Health check
 app.get('/', (req, res) => {
   res.json({ status: 'ready', message: 'Loom scraper is running' });
 });
