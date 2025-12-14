@@ -42,21 +42,45 @@ async function scrapeTranscripts() {
   await page.goto('https://www.loom.com/my-videos');
   await page.waitForTimeout(5000);
 
-  const videoLinks = await page.evaluate(() => {
+  // Get videos with their creation dates
+  const videos = await page.evaluate(() => {
     const links = Array.from(document.querySelectorAll('a[href*="/share/"]'));
-    return links.map(link => link.href).filter((url, index, self) => self.indexOf(url) === index);
+    return links.map(link => {
+      const url = link.href;
+      // Try to find date nearby the link
+      const container = link.closest('[data-video-id]') || link.closest('div');
+      const dateElement = container?.querySelector('time');
+      const dateString = dateElement?.getAttribute('datetime') || dateElement?.textContent;
+      
+      return {
+        url: url,
+        date: dateString
+      };
+    }).filter((item, index, self) => 
+      self.findIndex(v => v.url === item.url) === index
+    );
   });
 
-  console.log(`Found ${videoLinks.length} videos`);
+  // Filter to last 2 weeks
+  const twoWeeksAgo = new Date();
+  twoWeeksAgo.setDate(twoWeeksAgo.getDate() - 14);
+  
+  const recentVideos = videos.filter(v => {
+    if (!v.date) return true; // Include if we can't determine date
+    const videoDate = new Date(v.date);
+    return videoDate >= twoWeeksAgo;
+  });
 
-  for (const videoUrl of videoLinks) {
+  console.log(`Found ${videos.length} total videos, ${recentVideos.length} from last 2 weeks`);
+  
+  let processedCount = 0;
+
+  for (const video of recentVideos) {
     try {
-      await page.goto(videoUrl);
+      await page.goto(video.url);
       await page.waitForTimeout(3000);
 
-      // Extract title from the video page
       const title = await page.evaluate(() => {
-        // Try multiple selectors
         const h1 = document.querySelector('h1');
         const pageTitle = document.title;
         const metaTitle = document.querySelector('meta[property="og:title"]');
@@ -75,7 +99,6 @@ async function scrapeTranscripts() {
 
       console.log(`Processing: ${title}`);
 
-      // Extract VTT caption URL
       const vttUrl = await page.evaluate(() => {
         const track = document.querySelector('track[kind="captions"]');
         return track ? track.getAttribute('src') : null;
@@ -96,10 +119,10 @@ async function scrapeTranscripts() {
 
       if (transcript && transcript.length > 50) {
         const payload = {
-          video_id: videoUrl.split('/').pop(),
+          video_id: video.url.split('/').pop(),
           title: title,
           transcript: transcript,
-          video_url: videoUrl,
+          video_url: video.url,
           created_at: new Date().toISOString()
         };
 
@@ -113,6 +136,7 @@ async function scrapeTranscripts() {
 
         if (response.ok) {
           console.log(`✓ Sent to n8n: ${title}`);
+          processedCount++;
         } else {
           console.log(`❌ n8n error: ${response.status} ${response.statusText}`);
         }
@@ -120,12 +144,13 @@ async function scrapeTranscripts() {
         console.log('❌ Transcript too short or empty');
       }
     } catch (err) {
-      console.error(`Error processing ${videoUrl}:`, err.message);
+      console.error(`Error processing ${video.url}:`, err.message);
     }
   }
 
   await browser.close();
-  console.log('Scraping complete!');
+  console.log(`\n=== Scraping Complete ===`);
+  console.log(`Videos processed: ${processedCount}`);
 }
 
 app.get('/scrape', async (req, res) => {
