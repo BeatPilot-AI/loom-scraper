@@ -1,11 +1,9 @@
 const puppeteer = require('puppeteer');
-const { createClient } = require('@supabase/supabase-js');
+const express = require('express');
 require('dotenv').config();
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY
-);
+const app = express();
+const PORT = process.env.PORT || 3000;
 
 async function scrapeTranscripts() {
   const browser = await puppeteer.launch({
@@ -54,22 +52,18 @@ async function scrapeTranscripts() {
       });
 
       if (transcript) {
-        const { error } = await supabase
-          .from('loom_transcripts')
-          .upsert({
+        await fetch(process.env.N8N_WEBHOOK_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
             video_id: video.url.split('/').pop(),
             title: video.title,
             transcript: transcript,
             video_url: video.url,
-            created_at: new Date().toISOString(),
-            processed: false
-          }, { onConflict: 'video_id' });
-
-        if (error) {
-          console.error('Supabase error:', error);
-        } else {
-          console.log(`✓ Saved: ${video.title}`);
-        }
+            created_at: new Date().toISOString()
+          })
+        });
+        console.log(`✓ Sent to n8n: ${video.title}`);
       }
     } catch (err) {
       console.error(`Error processing ${video.url}:`, err);
@@ -80,4 +74,21 @@ async function scrapeTranscripts() {
   console.log('Scraping complete!');
 }
 
-scrapeTranscripts();
+// HTTP endpoint to trigger scraping
+app.get('/scrape', async (req, res) => {
+  res.json({ status: 'started', message: 'Scraping Loom transcripts...' });
+  
+  // Run scraping in background
+  scrapeTranscripts().catch(err => {
+    console.error('Scraping error:', err);
+  });
+});
+
+// Health check
+app.get('/', (req, res) => {
+  res.json({ status: 'ready', message: 'Loom scraper is running' });
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
